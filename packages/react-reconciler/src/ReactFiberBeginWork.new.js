@@ -13,6 +13,7 @@ import type {LazyComponent as LazyComponentType} from 'react/src/ReactLazy';
 import type {Fiber} from './ReactInternalTypes';
 import type {FiberRoot} from './ReactInternalTypes';
 import type {Lanes, Lane} from './ReactFiberLane';
+import type {MutableSource} from 'shared/ReactTypes';
 import type {
   SuspenseState,
   SuspenseListRenderState,
@@ -126,6 +127,7 @@ import {
   isSuspenseInstancePending,
   isSuspenseInstanceFallback,
   registerSuspenseInstanceRetry,
+  supportsHydration,
 } from './ReactFiberHostConfig';
 import type {SuspenseInstance} from './ReactFiberHostConfig';
 import {shouldSuspend} from './ReactFiberReconciler';
@@ -165,7 +167,6 @@ import {
   reenterHydrationStateFromDehydratedSuspenseInstance,
   resetHydrationState,
   tryToClaimNextHydratableInstance,
-  getIsHydrating,
   warnIfHydrating,
 } from './ReactFiberHydrationContext.new';
 import {
@@ -193,8 +194,12 @@ import {
   markSkippedUpdateLanes,
   getWorkInProgressRoot,
   pushRenderLanes,
+  getExecutionContext,
+  RetryAfterError,
+  NoContext,
 } from './ReactFiberWorkLoop.new';
 import {unstable_wrap as Schedule_tracing_wrap} from 'scheduler/tracing';
+import {setWorkInProgressVersion} from './ReactMutableSource.new';
 
 import {disableLogs, reenableLogs} from 'shared/ConsolePatchingDev';
 
@@ -566,7 +571,10 @@ function updateOffscreenComponent(
   const prevState: OffscreenState | null =
     current !== null ? current.memoizedState : null;
 
-  if (nextProps.mode === 'hidden') {
+  if (
+    nextProps.mode === 'hidden' ||
+    nextProps.mode === 'unstable-defer-without-hiding'
+  ) {
     if ((workInProgress.mode & ConcurrentMode) === NoMode) {
       // In legacy sync mode, don't defer the subtree. Render it now.
       // TODO: Figure out what we should do in Blocking mode.
@@ -575,13 +583,7 @@ function updateOffscreenComponent(
       };
       workInProgress.memoizedState = nextState;
       pushRenderLanes(workInProgress, renderLanes);
-    } else if (
-      !includesSomeLane(renderLanes, (OffscreenLane: Lane)) ||
-      // Server renderer does not render hidden subtrees, so if we're hydrating
-      // we should always bail out and schedule a subsequent render pass, to
-      // force a client render. Even if we're already at Offscreen priority.
-      (current === null && getIsHydrating())
-    ) {
+    } else if (!includesSomeLane(renderLanes, (OffscreenLane: Lane))) {
       let nextBaseLanes;
       if (prevState !== null) {
         const prevBaseLanes = prevState.baseLanes;
@@ -1070,6 +1072,20 @@ function updateHostRoot(current, workInProgress, renderLanes) {
     // We always try to hydrate. If this isn't a hydration pass there won't
     // be any children to hydrate which is effectively the same thing as
     // not hydrating.
+
+    if (supportsHydration) {
+      const mutableSourceEagerHydrationData =
+        root.mutableSourceEagerHydrationData;
+      if (mutableSourceEagerHydrationData != null) {
+        for (let i = 0; i < mutableSourceEagerHydrationData.length; i += 2) {
+          const mutableSource = ((mutableSourceEagerHydrationData[
+            i
+          ]: any): MutableSource<any>);
+          const version = mutableSourceEagerHydrationData[i + 1];
+          setWorkInProgressVersion(mutableSource, version);
+        }
+      }
+    }
 
     const child = mountChildFibers(
       workInProgress,
@@ -2253,6 +2269,14 @@ function updateDehydratedSuspenseComponent(
   // but after we've already committed once.
   warnIfHydrating();
 
+  if ((getExecutionContext() & RetryAfterError) !== NoContext) {
+    return retrySuspenseComponentWithoutHydrating(
+      current,
+      workInProgress,
+      renderLanes,
+    );
+  }
+
   if ((workInProgress.mode & BlockingMode) === NoMode) {
     return retrySuspenseComponentWithoutHydrating(
       current,
@@ -2917,7 +2941,7 @@ function bailoutOnAlreadyFinishedWork(
 ): Fiber | null {
   if (current !== null) {
     // Reuse previous dependencies
-    workInProgress.dependencies_new = current.dependencies_new;
+    workInProgress.dependencies = current.dependencies;
   }
 
   if (enableProfilerTimer) {
